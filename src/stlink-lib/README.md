@@ -1,0 +1,175 @@
+# stlink-lib backend notes
+
+This directory contains the transport backends used by the common stlink code.
+The common code drives targets through `stlink_backend_t` function pointers;
+backend implementations translate those operations into the actual transport.
+
+The main backends are:
+
+- `usb.c`: native USB/libusb ST-LINK backend.
+- `sg_legacy.c`: legacy SCSI passthrough backend.
+- `remote.c`: TCP backend used by `st-server` and client-side `--remote`.
+
+## Remote Backend
+
+The remote backend lets a client tool drive an ST-LINK attached to another
+machine. The server process owns the real USB connection. The client still runs
+the normal high-level stlink logic: connect mode, chip detection, flash erase,
+program, verify, and GDB server behavior.
+
+This split is deliberate. `st-server` is a thin executor for backend
+operations; it does not implement flash algorithms or target-specific policy.
+That keeps remote behavior close to local USB behavior and avoids duplicating
+target logic in the server.
+
+Typical flow:
+
+1. `st-server` opens a local ST-LINK with the USB backend.
+2. A client opens `st-flash --remote HOST:PORT`, `st-info --remote HOST:PORT`,
+   or `st-util --remote HOST:PORT`.
+3. The server sends a handshake with protocol and ST-LINK version data.
+4. The client creates a `stlink_t` using the remote backend.
+5. Common code calls backend operations on the client.
+6. `remote.c` serializes those calls over TCP.
+7. The server dispatches each RPC to the real USB backend and sends the result
+   back.
+
+## Device Ownership
+
+One `st-server` serves one already-open ST-LINK. To serve multiple probes, run
+multiple server processes on different ports:
+
+```sh
+st-server --serial aaa --port 4500
+st-server --serial bbb --port 4501
+```
+
+This keeps each probe independent. A long `st-util` session or flash operation
+on one probe cannot block another probe behind the same server process.
+
+## Protocol
+
+All integer fields are little-endian and encoded with `read_uint32()` and
+`write_uint32()`.
+
+Handshake, server to client:
+
+```text
+magic u32
+protocol_version u32
+capabilities u32
+stlink_v u32
+jtag_v u32
+swim_v u32
+st_vid u32
+stlink_pid u32
+jtag_api u32
+flags u32
+max_trace_freq u32
+serial char[STLINK_REMOTE_SERIAL_WIRE_LEN]
+```
+
+`protocol_version` is currently `STLINK_REMOTE_PROTOCOL_VERSION`.
+`capabilities` is reserved for future optional protocol features and is
+currently sent as zero.
+
+The `serial` field has a fixed on-wire size, `STLINK_REMOTE_SERIAL_WIRE_LEN`,
+that is intentionally **not** the same constant as the internal
+`STLINK_SERIAL_BUFFER_SIZE`. Pinning the wire size keeps the protocol layout
+stable even if the internal serial buffer changes; the server zero-pads the
+field and a compile-time check (`remote.h`) guarantees the buffer fits. If the
+wire size ever has to grow, bump `STLINK_REMOTE_PROTOCOL_VERSION`.
+
+Request, client to server:
+
+```text
+op u32
+ap u32
+arg0 u32
+arg1 u32
+payload_len u32
+payload bytes
+```
+
+Reply, server to client:
+
+```text
+status u32
+ret i32
+payload_len u32
+payload bytes
+```
+
+`status` describes the remote protocol result. `ret` is the backend return
+value and is valid when `status == REMOTE_REPLY_OK`, even when the backend
+returned `-1`. Protocol errors use `REMOTE_REPLY_PROTOCOL_ERROR`.
+
+Transport errors are not represented in the protocol because the TCP stream is
+not reliable enough to carry a reply after it fails. `send_all()` and
+`recv_all()` log TCP errors locally.
+
+## Register Encoding
+
+The remote protocol must not send C structs directly. `struct stlink_reg` is
+encoded field-by-field as fixed little-endian `u32` values. This avoids
+depending on compiler padding, host ABI, or host endianness.
+
+If `struct stlink_reg` changes, update both `reg_to_wire()` and
+`reg_from_wire()` in `remote.c`. If the wire layout changes incompatibly, bump
+`STLINK_REMOTE_PROTOCOL_VERSION`.
+
+## Access Ports
+
+The client owns the logical AP state. Each RPC carries the client's current
+`sl->ap`, and the server applies it before dispatching the backend operation.
+
+When common code calls `backend->init_ap()`, the remote backend sends
+`RPC_INIT_AP`; the server then calls the real USB backend's `init_ap()`.
+Therefore AP selection decisions stay client-side, while ST-LINK USB commands
+are executed server-side.
+
+## Connect Mode And Reset
+
+Connect mode -- normal, hot-plug, and connect-under-reset -- is a **client**
+concern, not a server option. `st-server` has no `--connect-under-reset` flag,
+and this is deliberate:
+
+- The server's `stlink_open_usb()` opens the *ST-LINK USB device* and returns a
+  valid handle even when the target connection fails. Hostile or sleeping
+  target firmware cannot stop the server from claiming the probe -- it can only
+  fail the *target* connect, which the server does not need.
+- The connect sequence is transport-agnostic and runs on the client over RPC.
+  When a client uses `--connect-under-reset`, `stlink_open_remote()` mirrors the
+  tail of `stlink_open_usb()`: it asserts `NRST` low (`RPC_JTAG_RESET`), then
+  runs `stlink_target_connect()` (enter SWD, probe AP, halt/reset) -- so the
+  exact under-reset connect happens on the real probe, just driven remotely.
+
+So the recovery path for a board whose firmware blocks a normal attach is the
+ordinary client flag, e.g.:
+
+```sh
+st-flash --remote HOST:PORT --connect-under-reset write firmware.bin 0x08000000
+```
+
+Putting reset policy on the server would duplicate connect logic in the thin
+transport layer and would reset the target on every server start, so it is left
+to the client. (This still relies on `NRST` being wired, exactly as local
+`--connect-under-reset` does.)
+
+## Bind Address And Security
+
+`st-server` defaults to `127.0.0.1:4500`. Binding to `0.0.0.0` or using
+`--bind=:PORT` exposes raw debug/flash control to the network. There is no
+authentication in the protocol. Use public binding only on trusted networks or
+through another access-control layer such as SSH.
+
+## Shutdown And Recovery
+
+`st-server` handles `SIGINT` and `SIGTERM` by leaving the accept loop and
+closing the ST-LINK handle through the normal `stlink_close()` path. This keeps
+normal shutdowns clean.
+
+Forced termination, crashes, or a killed process during a USB transfer can
+still leave the ST-LINK firmware or USB endpoint in a bad state. If local tools
+such as `st-info --probe` also hang, reset the USB device with `usbreset` or
+physically replug the probe.
