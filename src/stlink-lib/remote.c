@@ -28,8 +28,11 @@
 #include <win32_socket.h>
 #else
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #endif
@@ -43,6 +46,7 @@
 
 #define REQ_HDR_LEN 20
 #define REP_HDR_LEN 12
+#define REMOTE_CONNECT_TIMEOUT_SEC 5
 #define HANDSHAKE_LEN (44 + STLINK_REMOTE_SERIAL_WIRE_LEN)
 #define REG_CORE_COUNT 16
 #define REG_FLOAT_COUNT 32
@@ -126,6 +130,53 @@ static int32_t recv_all(int32_t fd, void *buf, uint32_t len) {
         len -= (uint32_t)n;
     }
     return (0);
+}
+
+// The protocol is strict request/reply, so disable Nagle's algorithm: with it,
+// small sends wait for ACKs and stall on delayed-ACK, adding latency to every
+// round trip (and a flash is thousands of them).
+static void set_tcp_nodelay(int32_t fd) {
+    int32_t one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const void *)&one, sizeof(one));
+}
+
+// connect() with a bounded wait so an unreachable/firewalled host fails in
+// seconds rather than blocking on the (long) OS default. POSIX only; Windows
+// falls back to a plain blocking connect.
+static int32_t remote_connect_timeout(int32_t fd, const struct sockaddr *addr,
+                                      socklen_t addrlen, int32_t timeout_sec) {
+#if defined(_WIN32)
+    (void)timeout_sec;
+    return (connect(fd, addr, addrlen) < 0) ? (-1) : (0);
+#else
+    int32_t flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) { return (-1); }
+
+    int32_t rc = connect(fd, addr, addrlen);
+    if (rc < 0 && errno == EINPROGRESS) {
+        fd_set wset;
+        FD_ZERO(&wset);
+        FD_SET(fd, &wset);
+        struct timeval tv = { timeout_sec, 0 };
+        rc = select(fd + 1, NULL, &wset, NULL, &tv);
+        if (rc == 0) {
+            errno = ETIMEDOUT;
+            rc = -1;
+        } else if (rc > 0) {
+            int32_t soerr = 0;
+            socklen_t len = sizeof(soerr);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &len) < 0 || soerr != 0) {
+                if (soerr) { errno = soerr; }
+                rc = -1;
+            } else {
+                rc = 0;
+            }
+        }
+    }
+
+    fcntl(fd, F_SETFL, flags); // restore blocking mode for the rest of the session
+    return (rc < 0) ? (-1) : (0);
+#endif
 }
 
 static int32_t send_reply(int32_t fd, uint32_t status, int32_t ret, const uint8_t *payload, uint32_t payload_len) {
@@ -299,9 +350,19 @@ static int32_t rb_write_reg(stlink_t *sl, uint32_t reg, int32_t idx) {
     return remote_rpc(sl, RPC_WRITE_REG, reg, (uint32_t)idx, NULL, 0, NULL, 0, NULL);
 }
 
-static int32_t rb_trace_enable(stlink_t *sl, uint32_t frequency) { (void)sl; (void)frequency; return (-1); }
-static int32_t rb_trace_disable(stlink_t *sl) { (void)sl; return (-1); }
-static int32_t rb_trace_read(stlink_t *sl, uint8_t *buf, uint32_t size) { (void)sl; (void)buf; (void)size; return (-1); }
+static int32_t rb_trace_enable(stlink_t *sl, uint32_t frequency) {
+    return remote_rpc(sl, RPC_TRACE_ENABLE, frequency, 0, NULL, 0, NULL, 0, NULL);
+}
+
+static int32_t rb_trace_disable(stlink_t *sl) {
+    return remote_rpc(sl, RPC_TRACE_DISABLE, 0, 0, NULL, 0, NULL, 0, NULL);
+}
+
+static int32_t rb_trace_read(stlink_t *sl, uint8_t *buf, uint32_t size) {
+    // trace_read returns the number of bytes captured; the reply carries that
+    // count in ret and the bytes themselves as the payload (0 = none available).
+    return remote_rpc(sl, RPC_TRACE_READ, size, 0, NULL, 0, buf, size, NULL);
+}
 
 static stlink_backend_t _stlink_remote_backend = {
     rb_close,
@@ -360,7 +421,8 @@ stlink_t *stlink_open_remote(int32_t verbose, const char *host, int32_t port,
     }
 
     int32_t fd = (int32_t)socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0 || connect(fd, res->ai_addr, (socklen_t)res->ai_addrlen) < 0) {
+    if (fd < 0 || remote_connect_timeout(fd, res->ai_addr, (socklen_t)res->ai_addrlen,
+                                         REMOTE_CONNECT_TIMEOUT_SEC) < 0) {
         fprintf(stderr, "remote: cannot connect to st-server at %s:%s (%s)\n",
                 host, portstr, strerror(errno));
         if (fd >= 0) { close(fd); }
@@ -368,6 +430,7 @@ stlink_t *stlink_open_remote(int32_t verbose, const char *host, int32_t port,
         return (NULL);
     }
     freeaddrinfo(res);
+    set_tcp_nodelay(fd);
 
     uint8_t hs[HANDSHAKE_LEN];
     if (recv_all(fd, hs, HANDSHAKE_LEN) || read_uint32(hs, 0) != STLINK_REMOTE_MAGIC) {
@@ -458,6 +521,8 @@ stlink_t *stlink_open_remote_str(int32_t verbose, const char *hostport,
 /* === server dispatch === */
 
 int32_t stlink_remote_serve(stlink_t *sl, int32_t fd) {
+    set_tcp_nodelay(fd);
+
     uint8_t hs[HANDSHAKE_LEN];
     write_uint32(&hs[0],  STLINK_REMOTE_MAGIC);
     write_uint32(&hs[4],  STLINK_REMOTE_PROTOCOL_VERSION);
@@ -515,6 +580,18 @@ int32_t stlink_remote_serve(stlink_t *sl, int32_t fd) {
         case RPC_TARGET_VOLTAGE: ret = sl->backend->target_voltage(sl); break;
         case RPC_SET_SWDCLK:  ret = sl->backend->set_swdclk(sl, (int32_t)a0); break;
         case RPC_INIT_AP:     ret = sl->backend->init_ap ? sl->backend->init_ap(sl, (uint8_t)a0) : -1; break;
+        case RPC_TRACE_ENABLE:  ret = sl->backend->trace_enable ? sl->backend->trace_enable(sl, a0) : -1; break;
+        case RPC_TRACE_DISABLE: ret = sl->backend->trace_disable ? sl->backend->trace_disable(sl) : -1; break;
+        case RPC_TRACE_READ:
+            // ret = bytes captured (into q_buf); send them as the payload.
+            if (a0 > Q_BUF_LEN) {
+                ELOG("remote: TRACE_READ size too large (%u > %u)\n", a0, Q_BUF_LEN);
+                status = REMOTE_REPLY_PROTOCOL_ERROR;
+            } else if (sl->backend->trace_read) {
+                ret = sl->backend->trace_read(sl, sl->q_buf, a0);
+                if (ret > 0) { rpay = (uint8_t *)sl->q_buf; rplen = (uint32_t)ret; }
+            }
+            break;
         case RPC_CORE_ID:
             ret = sl->backend->core_id(sl);
             write_uint32(scratch, sl->core_id); rpay = scratch; rplen = 4;

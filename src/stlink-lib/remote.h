@@ -66,6 +66,9 @@ enum stlink_remote_op {
     RPC_TARGET_VOLTAGE,
     RPC_SET_SWDCLK,
     RPC_INIT_AP,
+    RPC_TRACE_ENABLE,
+    RPC_TRACE_DISABLE,
+    RPC_TRACE_READ,
     RPC_CLOSE,
 };
 

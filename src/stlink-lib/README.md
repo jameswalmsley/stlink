@@ -156,12 +156,39 @@ transport layer and would reset the target on every server start, so it is left
 to the client. (This still relies on `NRST` being wired, exactly as local
 `--connect-under-reset` does.)
 
+## Trace (SWO)
+
+SWO/SWV trace works over the remote backend. `trace_enable`/`trace_disable` are
+plain RPCs; `trace_read` is a variable-length read where the reply's `ret` is
+the captured byte count and the payload carries the bytes (0 = none available).
+`st-trace --remote HOST:PORT` then behaves like the local tool.
+
+Unlike flash and debug, trace is **best-effort**. It is a continuous stream and
+the ST-LINK has a finite trace FIFO, so every `trace_read` poll is a network
+round trip. On a LAN or SSH tunnel (with `TCP_NODELAY`, which the backend sets)
+polling keeps up with typical SWO rates; on a high-latency link the FIFO can
+overflow and trace bytes are dropped silently. Use trace over remote on
+low-latency links only.
+
 ## Bind Address And Security
 
-`st-server` defaults to `127.0.0.1:4500`. Binding to `0.0.0.0` or using
-`--bind=:PORT` exposes raw debug/flash control to the network. There is no
-authentication in the protocol. Use public binding only on trusted networks or
-through another access-control layer such as SSH.
+The protocol has no authentication or encryption, so any client that can reach
+the port has full debug/flash control of the probe. `st-server` therefore
+defaults to the loopback bind `127.0.0.1:4500`.
+
+The recommended way to use a probe across machines is an **SSH tunnel**: it
+keeps the bind on loopback and adds authentication and encryption for free.
+
+```sh
+# on the host with the probe:
+st-server
+# on the client:
+ssh -N -L 4500:127.0.0.1:4500 user@probe-host &
+st-flash --remote 127.0.0.1:4500 write fw.bin 0x08000000
+```
+
+Only bind to `0.0.0.0` (or `--bind=:PORT`) on a fully trusted, isolated network.
+See `st-server(1)` for a systemd deployment example.
 
 ## Shutdown And Recovery
 
